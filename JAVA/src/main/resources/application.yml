@@ -1,0 +1,45 @@
+spring:
+  application:
+    name: yue-lock
+  datasource:
+    url: jdbc:h2:file:./data/yuelock;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+  h2:
+    console:
+      enabled: true
+      path: /h2
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+
+server:
+  port: 8080
+
+yuelock:
+  jwt:
+    secret: change-me-to-a-long-random-secret-at-least-32-chars
+    expire-hours: 168
+  cors-origins: "*"
+
+---
+spring:
+  config:
+    activate:
+      on-profile: postgres
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/yuelock}
+    username: ${DB_USER:yuelock}
+    password: ${DB_PASSWORD:yuelock}
+    driver-class-name: org.postgresql.Driver
+  h2:
+    console:
+      enabled: false
