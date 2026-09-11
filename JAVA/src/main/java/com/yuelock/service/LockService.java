@@ -100,8 +100,19 @@ public class LockService {
     return toView(lock, false);
   }
 
+  @Transactional
   public LockView byWearer(String token) {
-    return locks.findByWearerToken(requireToken(token)).map(l -> toView(l, false)).orElse(null);
+    return locks
+        .findByWearerToken(requireToken(token))
+        .map(
+            l -> {
+              long now = System.currentTimeMillis();
+              if (settleOverdueObedience(l, now)) {
+                // already saved inside settleOverdueObedience
+              }
+              return toView(l, false);
+            })
+        .orElse(null);
   }
 
   public LockView byKeyholder(String token) {
@@ -268,7 +279,17 @@ public class LockService {
       lock.setPhraseFailPenaltyMs(clamp(req.phraseFailPenaltyMs(), MIN_MS, 30 * DAY));
     }
     lock.setUpdatedAt(Instant.now());
-    appendEvent(lock, "phrase_set", 0, "钥匙端更新结束宣言（" + phrase.length() + " 字）");
+    appendEvent(
+        lock,
+        "phrase_set",
+        0,
+        "钥匙端更新结束宣言（"
+            + phrase.length()
+            + " 字 · 错 "
+            + lock.getPhraseMaxFails()
+            + " 次加罚 "
+            + formatDurationZh(lock.getPhraseFailPenaltyMs())
+            + "）");
     return toView(locks.save(lock), true);
   }
 
@@ -296,32 +317,54 @@ public class LockService {
       lock.setObedienceChallengeDueAt(null);
     }
     lock.setUpdatedAt(Instant.now());
-    appendEvent(lock, "obedience_set", 0, "钥匙端更新服从规则");
+    String summary =
+        (lock.isObedienceEnabled() ? "开启" : "关闭")
+            + " · 间隔 "
+            + (lock.getObedienceIntervalMs() / 60_000)
+            + " 分 · 时限 "
+            + (lock.getObedienceTimeoutMs() / 1000)
+            + " 秒 · 超时加罚 "
+            + formatDurationZh(lock.getObediencePenaltyMs());
+    appendEvent(lock, "obedience_set", 0, "钥匙端更新服从规则：" + summary);
     return toView(locks.save(lock), true);
   }
 
   /**
-   * Wearer poll: open / expire challenges. Must be called regularly while locked.
+   * Wearer poll: open / expire challenges. Timeout penalties are applied here
+   * without requiring a separate "fail" submit from the client. A scheduled job
+   * also settles overdue challenges when the browser is closed.
    */
   @Transactional
   public ObedienceStatus pollObedience(String token) {
     LockEntity lock = requireActiveWearer(token);
     long now = System.currentTimeMillis();
+    boolean justPenalized = false;
+    long justPenalizedMs = 0;
+
     if (!lock.isObedienceEnabled()) {
-      return idleObedience(lock, now);
+      if (lock.getObedienceChallengeDueAt() != null) {
+        lock.setObedienceChallengeDueAt(null);
+        locks.save(lock);
+      }
+      return idleObedience(lock, now, false, 0);
     }
-    // Frozen: do not open new challenges; still expire an already-open one.
+
     if (lock.getObedienceChallengeDueAt() != null) {
       if (now > lock.getObedienceChallengeDueAt()) {
-        failObedienceChallenge(lock, now, "服从超时未完成");
+        justPenalizedMs = penaltyOf(lock);
+        failObedienceChallenge(lock, now, "服从超时未完成（服务端结算）");
         locks.save(lock);
-        return idleObedience(lock, now);
+        justPenalized = true;
+        // Fall through — may open the next challenge immediately if interval elapsed.
+      } else {
+        return openObedience(lock, now, false, 0);
       }
-      return openObedience(lock, now);
     }
+
     if (lock.getFrozenAt() != null) {
-      return idleObedience(lock, now);
+      return idleObedience(lock, now, justPenalized, justPenalizedMs);
     }
+
     long last =
         lock.getObedienceLastCompletedAt() == null
             ? lock.getStartedAt()
@@ -335,9 +378,9 @@ public class LockService {
       lock.setUpdatedAt(Instant.now());
       appendEvent(lock, "obedience_open", timeout, "服从确认开始");
       locks.save(lock);
-      return openObedience(lock, now);
+      return openObedience(lock, now, justPenalized, justPenalizedMs);
     }
-    return idleObedience(lock, now);
+    return idleObedience(lock, now, justPenalized, justPenalizedMs);
   }
 
   @Transactional
@@ -351,9 +394,10 @@ public class LockService {
       throw new IllegalArgumentException("当前没有服从任务");
     }
     if (now > lock.getObedienceChallengeDueAt()) {
-      failObedienceChallenge(lock, now, "服从超时未完成");
+      long penalty = penaltyOf(lock);
+      failObedienceChallenge(lock, now, "服从超时未完成（服务端结算）");
       locks.save(lock);
-      throw new IllegalArgumentException("已超时，已加罚 " + formatDurationZh(penaltyOf(lock)));
+      throw new IllegalArgumentException("已超时，已加罚 " + formatDurationZh(penalty));
     }
     String expected = normalizePhrase(lock.getObediencePhrase());
     String actual = normalizePhrase(req.phrase() == null ? "" : req.phrase());
@@ -369,15 +413,35 @@ public class LockService {
     lock.setUpdatedAt(Instant.now());
     appendEvent(lock, "obedience_success", 0, "服从确认成功");
     locks.save(lock);
-    return idleObedience(lock, now);
+    return idleObedience(lock, now, false, 0);
+  }
+
+  /**
+   * Apply timeout penalty if a challenge is past due. Safe to call from poll,
+   * wearer reads, integrity sync, and the background scheduler.
+   *
+   * @return true if a penalty was applied
+   */
+  @Transactional
+  public boolean settleOverdueObedience(LockEntity lock, long now) {
+    if (lock == null || !"active".equals(lock.getStatus())) return false;
+    if (!lock.isObedienceEnabled()) return false;
+    Long due = lock.getObedienceChallengeDueAt();
+    if (due == null || now <= due) return false;
+    failObedienceChallenge(lock, now, "服从超时未完成（服务端结算）");
+    locks.save(lock);
+    return true;
   }
 
   private void failObedienceChallenge(LockEntity lock, long now, String detail) {
+    Long due = lock.getObedienceChallengeDueAt();
     long penalty = penaltyOf(lock);
     applyTimeDelta(lock, penalty, now);
     lock.setObedienceFailCount(lock.getObedienceFailCount() + 1);
     lock.setObedienceChallengeDueAt(null);
-    lock.setObedienceLastCompletedAt(now);
+    // Anchor to the original deadline so closing the browser cannot "reset" the
+    // interval clock to the moment they come back online.
+    lock.setObedienceLastCompletedAt(due != null ? due : now);
     lock.setUpdatedAt(Instant.now());
     appendEvent(lock, "obedience_fail", penalty, detail);
   }
@@ -386,7 +450,8 @@ public class LockService {
     return lock.getObediencePenaltyMs() == null ? 3_600_000L : lock.getObediencePenaltyMs();
   }
 
-  private ObedienceStatus openObedience(LockEntity lock, long now) {
+  private ObedienceStatus openObedience(
+      LockEntity lock, long now, boolean justPenalized, long justPenalizedMs) {
     long due = lock.getObedienceChallengeDueAt();
     return new ObedienceStatus(
         true,
@@ -397,10 +462,13 @@ public class LockService {
         penaltyOf(lock),
         lock.getObedienceSuccessCount(),
         lock.getObedienceFailCount(),
+        justPenalized,
+        justPenalizedMs,
         toView(lock, false));
   }
 
-  private ObedienceStatus idleObedience(LockEntity lock, long now) {
+  private ObedienceStatus idleObedience(
+      LockEntity lock, long now, boolean justPenalized, long justPenalizedMs) {
     return new ObedienceStatus(
         false,
         null,
@@ -410,6 +478,8 @@ public class LockService {
         penaltyOf(lock),
         lock.getObedienceSuccessCount(),
         lock.getObedienceFailCount(),
+        justPenalized,
+        justPenalizedMs,
         toView(lock, false));
   }
 
@@ -495,6 +565,7 @@ public class LockService {
   public IntegrityResponse syncIntegrity(IntegrityRequest req) {
     LockEntity lock = requireActiveWearer(req.token());
     long now = System.currentTimeMillis();
+    settleOverdueObedience(lock, now);
     List<String> penalties = new ArrayList<>();
     Long last = lock.getLastClientNow();
     if (last != null && req.clientNow() < last - 30_000) {

@@ -58,6 +58,9 @@ public class LockDtos {
       long penaltyMs,
       int successCount,
       int failCount,
+      /** True when this call just applied a timeout penalty. */
+      boolean justPenalized,
+      long justPenalizedMs,
       LockView lock) {}
 
   public record PhotoSubmitRequest(String token, String thumbDataUrl) {}

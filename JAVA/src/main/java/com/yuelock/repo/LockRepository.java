@@ -13,4 +13,7 @@ public interface LockRepository extends JpaRepository<LockEntity, String> {
   List<LockEntity> findTop40ByWearerUserIdOrderByStartedAtDesc(String wearerUserId);
 
   List<LockEntity> findTop40ByKeyholderUserIdOrderByStartedAtDesc(String keyholderUserId);
+
+  List<LockEntity> findByStatusAndObedienceChallengeDueAtLessThanEqual(
+      String status, long dueAtInclusive);
 }

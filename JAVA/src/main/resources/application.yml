@@ -29,6 +29,9 @@ yuelock:
     secret: change-me-to-a-long-random-secret-at-least-32-chars
     expire-hours: 168
   cors-origins: "*"
+  # Background settle for overdue obedience (ms between scans)
+  obedience:
+    settle-ms: 15000
 
 ---
 spring:
