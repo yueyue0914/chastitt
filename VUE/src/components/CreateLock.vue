@@ -31,11 +31,37 @@
     </template>
 
     <label class="field">
-      结束宣言（到期/紧急需完整输入）
-      <input v-model="endPhrase" />
+      结束宣言（到期/紧急须完整输入，一字不差）
+      <input v-model="endPhrase" maxlength="200" autocomplete="off" />
+    </label>
+    <label class="field">
+      宣言输错几次后加罚
+      <input v-model.number="phraseMaxFails" type="number" min="1" max="20" />
+    </label>
+    <label class="field">
+      每次触发加罚（小时）
+      <input v-model.number="phraseFailPenaltyHours" type="number" min="0.1" step="0.5" />
     </label>
 
     <label class="check"><input v-model="obedienceEnabled" type="checkbox" /> 定期服从确认</label>
+    <template v-if="obedienceEnabled">
+      <label class="field">
+        服从间隔（分钟）
+        <input v-model.number="obedienceIntervalMin" type="number" min="1" max="1440" />
+      </label>
+      <label class="field">
+        服从短句
+        <input v-model="obediencePhrase" maxlength="80" />
+      </label>
+      <label class="field">
+        应答时限（秒）
+        <input v-model.number="obedienceTimeoutSec" type="number" min="30" max="1800" />
+      </label>
+      <label class="field">
+        超时加罚（小时）
+        <input v-model.number="obediencePenaltyHours" type="number" min="0.1" step="0.5" />
+      </label>
+    </template>
     <label class="check"><input v-model="notifyExpiry" type="checkbox" /> 到期本地通知</label>
 
     <p v-if="error" class="err">{{ error }}</p>
@@ -58,7 +84,13 @@ const allowHygiene = ref(false)
 const hygieneMaxMin = ref(15)
 const hygienePenaltyMode = ref('multiplier')
 const endPhrase = ref('我是主人的无面锁屌latex性偶')
+const phraseMaxFails = ref(3)
+const phraseFailPenaltyHours = ref(1)
 const obedienceEnabled = ref(true)
+const obedienceIntervalMin = ref(30)
+const obediencePhrase = ref('服从主人')
+const obedienceTimeoutSec = ref(120)
+const obediencePenaltyHours = ref(1)
 const notifyExpiry = ref(true)
 const busy = ref(false)
 const error = ref('')
@@ -79,11 +111,15 @@ async function submit() {
       hygienePenaltyFixedMs: 3600_000,
       hygienePenaltyMultiplier: 2,
       endPhrase: endPhrase.value,
+      phraseMaxFails: phraseMaxFails.value,
+      phraseFailPenaltyMs: hoursToMs(phraseFailPenaltyHours.value),
       notifyExpiry: notifyExpiry.value,
       minLockMs: durationMs,
       obedienceEnabled: obedienceEnabled.value,
-      obedienceIntervalMs: 30 * 60_000,
-      obediencePhrase: '服从主人',
+      obedienceIntervalMs: obedienceIntervalMin.value * 60_000,
+      obediencePhrase: obediencePhrase.value,
+      obedienceTimeoutMs: obedienceTimeoutSec.value * 1000,
+      obediencePenaltyMs: hoursToMs(obediencePenaltyHours.value),
     })
     emit('created')
   } catch (e) {

@@ -19,6 +19,14 @@ export const subTime = (data) => api.post('/api/locks/keyholder/sub-time', data)
 export const setFreeze = (data) => api.post('/api/locks/keyholder/freeze', data).then((r) => r.data)
 export const setMinLock = (data) =>
   api.post('/api/locks/keyholder/min-lock', data).then((r) => r.data)
+export const setEndPhrase = (data) =>
+  api.post('/api/locks/keyholder/end-phrase', data).then((r) => r.data)
+export const setObedience = (data) =>
+  api.post('/api/locks/keyholder/obedience', data).then((r) => r.data)
+export const pollObedience = (token) =>
+  api.post('/api/locks/obedience/poll', { token }).then((r) => r.data)
+export const completeObedience = (data) =>
+  api.post('/api/locks/obedience/complete', data).then((r) => r.data)
 export const photoRequest = (data) =>
   api.post('/api/locks/keyholder/photo-request', data).then((r) => r.data)
 export const photoSubmit = (data) => api.post('/api/locks/wearer/photo', data).then((r) => r.data)

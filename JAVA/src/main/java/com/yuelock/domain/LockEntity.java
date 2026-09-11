@@ -61,6 +61,17 @@ public class LockEntity {
   @Column(name = "end_phrase", nullable = false)
   private String endPhrase = "";
 
+  /** Consecutive wrong end-phrase attempts since last reset. */
+  @Column(name = "phrase_fail_count", nullable = false)
+  private int phraseFailCount = 0;
+
+  /** After this many wrong attempts, apply phraseFailPenaltyMs and reset count. */
+  @Column(name = "phrase_max_fails", nullable = false)
+  private int phraseMaxFails = 3;
+
+  @Column(name = "phrase_fail_penalty_ms", nullable = false)
+  private Long phraseFailPenaltyMs = 3_600_000L;
+
   @Column(name = "notify_expiry", nullable = false)
   private boolean notifyExpiry = true;
 
@@ -91,6 +102,27 @@ public class LockEntity {
 
   @Column(name = "obedience_phrase", nullable = false)
   private String obediencePhrase = "服从主人";
+
+  /** How long the wearer has to complete an open challenge. */
+  @Column(name = "obedience_timeout_ms", nullable = false)
+  private Long obedienceTimeoutMs = 120_000L;
+
+  @Column(name = "obedience_penalty_ms", nullable = false)
+  private Long obediencePenaltyMs = 3_600_000L;
+
+  @Column(name = "obedience_success_count", nullable = false)
+  private int obedienceSuccessCount = 0;
+
+  @Column(name = "obedience_fail_count", nullable = false)
+  private int obedienceFailCount = 0;
+
+  /** Last successful completion (or lock start). Used to schedule next challenge. */
+  @Column(name = "obedience_last_completed_at")
+  private Long obedienceLastCompletedAt;
+
+  /** When non-null, a challenge is open and must be completed by this epoch ms. */
+  @Column(name = "obedience_challenge_due_at")
+  private Long obedienceChallengeDueAt;
 
   @Column(name = "last_client_now")
   private Long lastClientNow;

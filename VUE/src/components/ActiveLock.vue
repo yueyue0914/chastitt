@@ -43,7 +43,7 @@
     <button
       v-if="canEnd"
       class="btn"
-      :disabled="busy"
+      :disabled="busy || obedience.required"
       @click="openEnd = true"
     >
       输入宣言结束
@@ -51,7 +51,7 @@
     <button
       v-if="lock.allowEmergency"
       class="btn warn"
-      :disabled="busy"
+      :disabled="busy || obedience.required"
       @click="openEmergency = true"
     >
       紧急解锁
@@ -60,36 +60,82 @@
     <div v-if="events.length" class="card stack">
       <p class="muted">历史</p>
       <div v-for="e in events" :key="e.id" class="muted" style="font-size:0.8rem">
-        {{ e.kind }} · {{ e.detail }}
+        {{ eventLabel(e) }}
       </div>
     </div>
 
-    <div v-if="openEnd || openEmergency" class="modal" @click.self="closeModals">
+    <div v-if="openEnd || openEmergency" class="modal">
       <div class="panel stack">
         <h2 class="font-display" style="margin:0;font-size:1.4rem">
           {{ openEmergency ? '紧急解锁' : '结束锁定' }}
         </h2>
-        <p class="muted">请完整输入结束宣言</p>
-        <input v-model="phrase" />
+        <p class="muted">
+          请完整输入结束宣言（须一字不差，共 {{ phraseLen }} 字）。
+          当前输错 {{ lock.phraseFailCount || 0 }}/{{ lock.phraseMaxFails || 3 }}，
+          满额将加罚 {{ formatDuration(lock.phraseFailPenaltyMs || 3600000) }}。
+        </p>
+        <input
+          v-model="phrase"
+          autocomplete="off"
+          autocorrect="off"
+          spellcheck="false"
+          placeholder="在此完整输入宣言…"
+          @paste.prevent
+        />
         <p v-if="localErr" class="err">{{ localErr }}</p>
-        <button class="btn" :disabled="busy" @click="confirmUnlock">确认</button>
-        <button class="btn secondary" @click="closeModals">取消</button>
+        <button class="btn" :disabled="busy || !phrase.trim()" @click="confirmUnlock">确认</button>
+        <button class="btn secondary" :disabled="busy" @click="closeModals">取消</button>
       </div>
     </div>
 
-    <div v-if="obedienceOpen" class="modal">
-      <div class="panel stack">
-        <h2 class="font-display" style="margin:0;font-size:1.4rem">服从确认</h2>
-        <p class="muted">请输入：{{ lock.obediencePhrase }}</p>
-        <input v-model="obedienceInput" />
-        <button class="btn" @click="confirmObedience">确认</button>
+    <!-- Forced obedience: no dismiss, no cancel, blocks entire viewport -->
+    <Teleport to="body">
+      <div
+        v-if="obedience.required"
+        class="obedience-force"
+        @keydown.esc.prevent
+        @keydown.tab.prevent
+      >
+        <div class="obedience-force__panel stack">
+          <p class="eyebrow" style="text-align:center">Obedience</p>
+          <h2 class="font-display" style="margin:0;font-size:1.75rem;text-align:center">服从确认</h2>
+          <p class="muted" style="text-align:center">
+            必须完整输入短句才能继续。剩余
+            <strong style="color:var(--fg)">{{ formatDuration(obedienceRemain) }}</strong>
+            ，超时将加罚 {{ formatDuration(obedience.penaltyMs || 3600000) }}。
+          </p>
+          <p style="text-align:center;font-size:1.15rem;letter-spacing:0.04em">
+            {{ obedience.phrase }}
+          </p>
+          <input
+            ref="obedienceInputEl"
+            v-model="obedienceInput"
+            autocomplete="off"
+            autocorrect="off"
+            spellcheck="false"
+            placeholder="在此输入短句…"
+            @paste.prevent
+            @keydown.enter.prevent="submitObedience"
+          />
+          <p v-if="obedienceErr" class="err" style="text-align:center">{{ obedienceErr }}</p>
+          <button
+            class="btn"
+            :disabled="obedienceBusy || !obedienceInput.trim()"
+            @click="submitObedience"
+          >
+            {{ obedienceBusy ? '提交中…' : '确认服从' }}
+          </button>
+          <p class="muted" style="text-align:center;font-size:0.75rem">
+            成功 {{ obedience.successCount || 0 }} · 失败 {{ obedience.failCount || 0 }}
+          </p>
+        </div>
       </div>
-    </div>
+    </Teleport>
   </section>
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import * as api from '../api/lock'
 import { canWearerEnd, formatDuration, remainingMs } from '../utils/time'
 
@@ -103,36 +149,103 @@ const openEnd = ref(false)
 const openEmergency = ref(false)
 const events = ref([])
 const tasks = ref([])
-const obedienceOpen = ref(false)
+const obedience = ref({ required: false })
 const obedienceInput = ref('')
+const obedienceErr = ref('')
+const obedienceBusy = ref(false)
+const obedienceInputEl = ref(null)
 const keyUrl = computed(() => `${location.origin}/key/${props.lock.keyholderToken}`)
 const remain = computed(() => remainingMs(props.lock, props.now))
 const canEnd = computed(() => canWearerEnd(props.lock, props.now))
 const openTasks = computed(() => tasks.value.filter((t) => t.status === 'open'))
+const phraseLen = computed(
+  () => props.lock.endPhraseLength || (props.lock.endPhrase || '').length,
+)
+const obedienceRemain = computed(() => {
+  if (!obedience.value?.required || !obedience.value.dueAt) return 0
+  return Math.max(0, obedience.value.dueAt - props.now)
+})
 
-let obedienceTimer
+const EVENT_LABELS = {
+  started: '开始锁定',
+  ended: '到期结束',
+  emergency: '紧急解锁',
+  emergency_penalty: '紧急永久惩罚',
+  phrase_fail: '宣言输错',
+  phrase_fail_penalty: '宣言输错加罚',
+  phrase_set: '更新结束宣言',
+  hygiene_penalty: '清洁超时惩罚',
+  keyholder_unlock: '钥匙开锁',
+  keyholder_add_time: '钥匙加时',
+  keyholder_sub_time: '钥匙减时',
+  freeze: '冻结',
+  unfreeze: '解冻',
+  integrity_penalty: '完整性惩罚',
+  obedience_open: '服从开始',
+  obedience_success: '服从成功',
+  obedience_fail: '服从失败加罚',
+  obedience_set: '更新服从规则',
+}
+
+function eventLabel(e) {
+  const name = EVENT_LABELS[e.kind] || e.kind
+  const extra = e.amountMs ? ` · ${formatDuration(e.amountMs)}` : ''
+  return `${name}${extra} · ${e.detail || ''}`
+}
+
+let pollObTimer
 
 async function loadMeta() {
   events.value = await api.listEvents(props.lock.wearerToken, 'wearer')
   tasks.value = await api.listTasks(props.lock.wearerToken, 'wearer')
 }
 
+async function tickObedience() {
+  if (!props.lock?.wearerToken || props.lock.status !== 'active') return
+  try {
+    const status = await api.pollObedience(props.lock.wearerToken)
+    const wasRequired = obedience.value.required
+    obedience.value = status
+    if (status.lock?.id) emit('changed', status.lock)
+    if (status.required && !wasRequired) {
+      obedienceInput.value = ''
+      obedienceErr.value = ''
+      await nextTick()
+      obedienceInputEl.value?.focus()
+    }
+    if (!status.required && wasRequired) {
+      await loadMeta()
+    }
+  } catch {
+    /* keep last status */
+  }
+}
+
+function onKeydown(e) {
+  if (!obedience.value.required) return
+  if (e.key === 'Escape' || e.key === 'F5') {
+    e.preventDefault()
+    e.stopPropagation()
+  }
+}
+
 onMounted(() => {
   loadMeta().catch(() => {})
-  if (props.lock.obedienceEnabled) {
-    obedienceTimer = setInterval(() => {
-      const key = `yue-ob:${props.lock.id}`
-      const last = Number(localStorage.getItem(key) || 0)
-      if (Date.now() - last >= (props.lock.obedienceIntervalMs || 1800000)) {
-        obedienceOpen.value = true
-      }
-    }, 5000)
-  }
+  tickObedience()
+  pollObTimer = setInterval(tickObedience, 2000)
+  window.addEventListener('keydown', onKeydown, true)
 })
-onUnmounted(() => clearInterval(obedienceTimer))
-watch(() => props.lock.id, () => loadMeta().catch(() => {}))
+onUnmounted(() => {
+  clearInterval(pollObTimer)
+  window.removeEventListener('keydown', onKeydown, true)
+})
+watch(() => props.lock.id, () => {
+  loadMeta().catch(() => {})
+  tickObedience()
+})
 
 function closeModals() {
+  if (obedience.value.required) return
   openEnd.value = false
   openEmergency.value = false
   phrase.value = ''
@@ -172,24 +285,56 @@ async function doTask(taskId) {
   emit('changed', res.lock)
 }
 async function confirmUnlock() {
-  await run(() =>
-    api.unlock({
+  busy.value = true
+  localErr.value = ''
+  try {
+    const next = await api.unlock({
       token: props.lock.wearerToken,
       mode: openEmergency.value ? 'emergency' : 'expiry',
       phrase: phrase.value,
-    }),
-  )
-  closeModals()
+    })
+    emit('changed', next)
+    await loadMeta()
+    closeModals()
+  } catch (e) {
+    localErr.value = e.message
+    try {
+      const remote = await api.getByWearer(props.lock.wearerToken)
+      if (remote?.id) {
+        emit('changed', remote)
+        await loadMeta()
+      }
+    } catch {
+      /* ignore */
+    }
+  } finally {
+    busy.value = false
+  }
 }
 async function submitPhoto() {
   const thumbDataUrl =
     'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
   await run(() => api.photoSubmit({ token: props.lock.wearerToken, thumbDataUrl }))
 }
-function confirmObedience() {
-  if (obedienceInput.value.trim() !== props.lock.obediencePhrase) return
-  localStorage.setItem(`yue-ob:${props.lock.id}`, String(Date.now()))
-  obedienceOpen.value = false
-  obedienceInput.value = ''
+
+async function submitObedience() {
+  if (!obedience.value.required || obedienceBusy.value) return
+  obedienceBusy.value = true
+  obedienceErr.value = ''
+  try {
+    const status = await api.completeObedience({
+      token: props.lock.wearerToken,
+      phrase: obedienceInput.value,
+    })
+    obedience.value = status
+    if (status.lock?.id) emit('changed', status.lock)
+    obedienceInput.value = ''
+    await loadMeta()
+  } catch (e) {
+    obedienceErr.value = e.message
+    await tickObedience()
+  } finally {
+    obedienceBusy.value = false
+  }
 }
 </script>

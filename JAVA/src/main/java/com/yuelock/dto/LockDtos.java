@@ -14,11 +14,15 @@ public class LockDtos {
       long hygienePenaltyFixedMs,
       double hygienePenaltyMultiplier,
       String endPhrase,
+      int phraseMaxFails,
+      long phraseFailPenaltyMs,
       boolean notifyExpiry,
       long minLockMs,
       Boolean obedienceEnabled,
       long obedienceIntervalMs,
-      String obediencePhrase) {}
+      String obediencePhrase,
+      long obedienceTimeoutMs,
+      long obediencePenaltyMs) {}
 
   public record TokenRequest(String token) {}
 
@@ -31,6 +35,30 @@ public class LockDtos {
   public record FreezeRequest(String token, boolean frozen) {}
 
   public record MinLockRequest(String token, long minLockMs) {}
+
+  public record SetEndPhraseRequest(
+      String token, String endPhrase, Integer phraseMaxFails, Long phraseFailPenaltyMs) {}
+
+  public record SetObedienceRequest(
+      String token,
+      Boolean enabled,
+      Long intervalMs,
+      String phrase,
+      Long timeoutMs,
+      Long penaltyMs) {}
+
+  public record ObedienceCompleteRequest(String token, String phrase) {}
+
+  public record ObedienceStatus(
+      boolean required,
+      String phrase,
+      Long dueAt,
+      long serverNow,
+      long remainMs,
+      long penaltyMs,
+      int successCount,
+      int failCount,
+      LockView lock) {}
 
   public record PhotoSubmitRequest(String token, String thumbDataUrl) {}
 
@@ -58,7 +86,13 @@ public class LockDtos {
       String hygienePenaltyMode,
       long hygienePenaltyFixedMs,
       double hygienePenaltyMultiplier,
+      /** Full phrase — only filled for keyholder views; empty for wearer. */
       String endPhrase,
+      /** Phrase character count (safe to show wearer). */
+      int endPhraseLength,
+      int phraseFailCount,
+      int phraseMaxFails,
+      long phraseFailPenaltyMs,
       boolean notifyExpiry,
       Long hygieneStartedAt,
       Long frozenAt,
@@ -69,6 +103,11 @@ public class LockDtos {
       boolean obedienceEnabled,
       long obedienceIntervalMs,
       String obediencePhrase,
+      long obedienceTimeoutMs,
+      long obediencePenaltyMs,
+      int obedienceSuccessCount,
+      int obedienceFailCount,
+      Long obedienceChallengeDueAt,
       Long lastClientNow,
       int integrityPenaltyCount,
       String sessionNonce,

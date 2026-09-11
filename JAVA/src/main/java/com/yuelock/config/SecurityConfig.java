@@ -47,6 +47,7 @@ public class SecurityConfig {
                         "/api/locks/wearer/**",
                         "/api/locks/tasks/**",
                         "/api/locks/integrity/**",
+                        "/api/locks/obedience/**",
                         "/api/locks/*/events")
                     .permitAll()
                     .anyRequest()

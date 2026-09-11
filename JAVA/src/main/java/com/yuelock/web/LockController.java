@@ -75,6 +75,26 @@ public class LockController {
     return locks.setMinLock(req);
   }
 
+  @PostMapping("/locks/keyholder/end-phrase")
+  public LockView setEndPhrase(@RequestBody SetEndPhraseRequest req) {
+    return locks.setEndPhrase(req);
+  }
+
+  @PostMapping("/locks/keyholder/obedience")
+  public LockView setObedience(@RequestBody SetObedienceRequest req) {
+    return locks.setObedience(req);
+  }
+
+  @PostMapping("/locks/obedience/poll")
+  public ObedienceStatus pollObedience(@RequestBody TokenRequest req) {
+    return locks.pollObedience(req.token());
+  }
+
+  @PostMapping("/locks/obedience/complete")
+  public ObedienceStatus completeObedience(@RequestBody ObedienceCompleteRequest req) {
+    return locks.completeObedience(req);
+  }
+
   @PostMapping("/locks/keyholder/photo-request")
   public LockView photoRequest(@RequestBody TokenRequest req) {
     return locks.requestPhoto(req);

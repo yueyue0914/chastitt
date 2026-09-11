@@ -65,6 +65,13 @@ public class LockService {
     lock.setHygienePenaltyMultiplier(
         Math.max(0.5, Math.min(10, req.hygienePenaltyMultiplier() <= 0 ? 2 : req.hygienePenaltyMultiplier())));
     lock.setEndPhrase(endPhrase);
+    lock.setPhraseFailCount(0);
+    lock.setPhraseMaxFails(clampInt(req.phraseMaxFails() <= 0 ? 3 : req.phraseMaxFails(), 1, 20));
+    lock.setPhraseFailPenaltyMs(
+        clamp(
+            req.phraseFailPenaltyMs() <= 0 ? 3_600_000L : req.phraseFailPenaltyMs(),
+            MIN_MS,
+            30 * DAY));
     lock.setNotifyExpiry(req.notifyExpiry());
     lock.setMinLockMs(clamp(Math.max(0, req.minLockMs()), 0, Math.max(duration, MAX_DURATION)));
     lock.setObedienceEnabled(req.obedienceEnabled() == null || req.obedienceEnabled());
@@ -72,21 +79,33 @@ public class LockService {
         clamp(req.obedienceIntervalMs() <= 0 ? 1_800_000 : req.obedienceIntervalMs(), MIN_MS, DAY));
     String obPhrase = normalizePhrase(req.obediencePhrase());
     lock.setObediencePhrase(obPhrase.length() < 2 ? DEFAULT_OBEDIENCE : obPhrase);
+    lock.setObedienceTimeoutMs(
+        clamp(req.obedienceTimeoutMs() <= 0 ? 120_000 : req.obedienceTimeoutMs(), 30_000, 30 * 60_000));
+    lock.setObediencePenaltyMs(
+        clamp(
+            req.obediencePenaltyMs() <= 0 ? 3_600_000L : req.obediencePenaltyMs(),
+            MIN_MS,
+            30 * DAY));
+    lock.setObedienceSuccessCount(0);
+    lock.setObedienceFailCount(0);
+    lock.setObedienceLastCompletedAt(now);
+    lock.setObedienceChallengeDueAt(null);
     lock.setSessionNonce(randomToken());
     lock.setWearerUserId(userId);
     lock.setStatus("active");
     lock.setUpdatedAt(Instant.now());
     locks.save(lock);
     appendEvent(lock, "started", duration, "锁定开始");
-    return toView(lock);
+    // Wearer just set the phrase — still redact in API so later polls stay consistent.
+    return toView(lock, false);
   }
 
   public LockView byWearer(String token) {
-    return locks.findByWearerToken(requireToken(token)).map(this::toView).orElse(null);
+    return locks.findByWearerToken(requireToken(token)).map(l -> toView(l, false)).orElse(null);
   }
 
   public LockView byKeyholder(String token) {
-    return locks.findByKeyholderToken(requireToken(token)).map(this::toView).orElse(null);
+    return locks.findByKeyholderToken(requireToken(token)).map(l -> toView(l, true)).orElse(null);
   }
 
   public List<EventView> listEvents(String token, String role) {
@@ -111,13 +130,14 @@ public class LockService {
     if ("keyholder".equals(mode)) {
       LockEntity lock = requireActiveKeyholder(req.token());
       finish(lock, "ended", "keyholder_unlock", 0, "钥匙开锁");
-      return toView(lock);
+      return toView(lock, true);
     }
     if ("emergency".equals(mode)) {
       LockEntity lock = requireActiveWearer(req.token());
       if (!lock.isAllowEmergency()) throw new IllegalArgumentException("未开启紧急解锁");
-      requirePhrase(lock, req.phrase());
+      assertPhraseOrPenalize(lock, req.phrase());
       assertEmergencyAllowed(lock, now);
+      lock.setPhraseFailCount(0);
       lock.setEmergencyUseCount(lock.getEmergencyUseCount() + 1);
       lock.setEmergencyLastUsedAt(now);
       clearTransient(lock);
@@ -128,14 +148,15 @@ public class LockService {
         appendEvent(lock, "emergency_penalty", lock.getEmergencyPenaltyMs(), "紧急永久惩罚");
       }
       locks.save(lock);
-      return toView(lock);
+      return toView(lock, false);
     }
     if ("expiry".equals(mode)) {
       LockEntity lock = requireActiveWearer(req.token());
-      requirePhrase(lock, req.phrase());
       if (!canWearerEnd(lock, now)) throw new IllegalArgumentException("尚未满足结束条件");
+      assertPhraseOrPenalize(lock, req.phrase());
+      lock.setPhraseFailCount(0);
       finish(lock, "ended", "ended", 0, "到期结束");
-      return toView(lock);
+      return toView(lock, false);
     }
     throw new IllegalArgumentException("未知解锁模式");
   }
@@ -143,8 +164,9 @@ public class LockService {
   @Transactional
   public LockView startHygiene(HygieneRequest req) {
     long now = System.currentTimeMillis();
+    boolean asKeyholder = "keyholder".equals(req.role());
     LockEntity lock;
-    if ("keyholder".equals(req.role())) {
+    if (asKeyholder) {
       lock = requireActiveKeyholder(req.token());
       lock.setAllowHygiene(true);
       appendEvent(lock, "force_hygiene", 0, "强制清洁");
@@ -156,11 +178,12 @@ public class LockService {
     if (lock.getHygieneStartedAt() != null) throw new IllegalArgumentException("清洁已在进行");
     lock.setHygieneStartedAt(now);
     lock.setUpdatedAt(Instant.now());
-    return toView(locks.save(lock));
+    return toView(locks.save(lock), asKeyholder);
   }
 
   @Transactional
   public LockView endHygiene(HygieneRequest req) {
+    boolean asKeyholder = "keyholder".equals(req.role());
     LockEntity lock = resolveActiveByRole(req.token(), req.role());
     if (lock.getHygieneStartedAt() == null) throw new IllegalArgumentException("当前没有清洁");
     long now = System.currentTimeMillis();
@@ -177,7 +200,7 @@ public class LockService {
     }
     lock.setHygieneStartedAt(null);
     lock.setUpdatedAt(Instant.now());
-    return toView(locks.save(lock));
+    return toView(locks.save(lock), asKeyholder);
   }
 
   @Transactional
@@ -186,7 +209,7 @@ public class LockService {
     long add = clamp(req.ms(), 1, 30 * DAY);
     applyTimeDelta(lock, add, System.currentTimeMillis());
     appendEvent(lock, "keyholder_add_time", add, "钥匙加时");
-    return toView(locks.save(lock));
+    return toView(locks.save(lock), true);
   }
 
   @Transactional
@@ -195,7 +218,7 @@ public class LockService {
     long sub = clamp(req.ms(), 1, 30 * DAY);
     applyTimeDelta(lock, -sub, System.currentTimeMillis());
     appendEvent(lock, "keyholder_sub_time", sub, "钥匙减时");
-    return toView(locks.save(lock));
+    return toView(locks.save(lock), true);
   }
 
   @Transactional
@@ -203,18 +226,18 @@ public class LockService {
     LockEntity lock = requireActiveKeyholder(req.token());
     long now = System.currentTimeMillis();
     if (req.frozen()) {
-      if (lock.getFrozenAt() != null) return toView(lock);
+      if (lock.getFrozenAt() != null) return toView(lock, true);
       lock.setFrozenAt(now);
       appendEvent(lock, "freeze", 0, "冻结");
     } else {
-      if (lock.getFrozenAt() == null) return toView(lock);
+      if (lock.getFrozenAt() == null) return toView(lock, true);
       long paused = Math.max(0, now - lock.getFrozenAt());
       applyTimeDelta(lock, paused, now);
       lock.setFrozenAt(null);
       appendEvent(lock, "unfreeze", paused, "解冻");
     }
     lock.setUpdatedAt(Instant.now());
-    return toView(locks.save(lock));
+    return toView(locks.save(lock), true);
   }
 
   @Transactional
@@ -223,7 +246,171 @@ public class LockService {
     lock.setMinLockMs(clamp(req.minLockMs(), 0, MAX_DURATION));
     lock.setUpdatedAt(Instant.now());
     appendEvent(lock, "min_lock_set", lock.getMinLockMs(), "最低锁定");
-    return toView(locks.save(lock));
+    return toView(locks.save(lock), true);
+  }
+
+  @Transactional
+  public LockView setEndPhrase(SetEndPhraseRequest req) {
+    LockEntity lock = requireActiveKeyholder(req.token());
+    String phrase = normalizePhrase(req.endPhrase());
+    if (phrase.length() < 4) {
+      throw new IllegalArgumentException("结束宣言至少 4 个字符");
+    }
+    if (phrase.length() > 200) {
+      phrase = phrase.substring(0, 200);
+    }
+    lock.setEndPhrase(phrase);
+    lock.setPhraseFailCount(0);
+    if (req.phraseMaxFails() != null) {
+      lock.setPhraseMaxFails(clampInt(req.phraseMaxFails(), 1, 20));
+    }
+    if (req.phraseFailPenaltyMs() != null && req.phraseFailPenaltyMs() > 0) {
+      lock.setPhraseFailPenaltyMs(clamp(req.phraseFailPenaltyMs(), MIN_MS, 30 * DAY));
+    }
+    lock.setUpdatedAt(Instant.now());
+    appendEvent(lock, "phrase_set", 0, "钥匙端更新结束宣言（" + phrase.length() + " 字）");
+    return toView(locks.save(lock), true);
+  }
+
+  @Transactional
+  public LockView setObedience(SetObedienceRequest req) {
+    LockEntity lock = requireActiveKeyholder(req.token());
+    if (req.enabled() != null) {
+      lock.setObedienceEnabled(req.enabled());
+    }
+    if (req.intervalMs() != null) {
+      lock.setObedienceIntervalMs(clamp(req.intervalMs(), MIN_MS, DAY));
+    }
+    if (req.phrase() != null) {
+      String p = normalizePhrase(req.phrase());
+      if (p.length() < 2) throw new IllegalArgumentException("服从短句至少 2 个字符");
+      lock.setObediencePhrase(p.length() > 80 ? p.substring(0, 80) : p);
+    }
+    if (req.timeoutMs() != null) {
+      lock.setObedienceTimeoutMs(clamp(req.timeoutMs(), 30_000, 30 * 60_000));
+    }
+    if (req.penaltyMs() != null) {
+      lock.setObediencePenaltyMs(clamp(req.penaltyMs(), MIN_MS, 30 * DAY));
+    }
+    if (!lock.isObedienceEnabled()) {
+      lock.setObedienceChallengeDueAt(null);
+    }
+    lock.setUpdatedAt(Instant.now());
+    appendEvent(lock, "obedience_set", 0, "钥匙端更新服从规则");
+    return toView(locks.save(lock), true);
+  }
+
+  /**
+   * Wearer poll: open / expire challenges. Must be called regularly while locked.
+   */
+  @Transactional
+  public ObedienceStatus pollObedience(String token) {
+    LockEntity lock = requireActiveWearer(token);
+    long now = System.currentTimeMillis();
+    if (!lock.isObedienceEnabled()) {
+      return idleObedience(lock, now);
+    }
+    // Frozen: do not open new challenges; still expire an already-open one.
+    if (lock.getObedienceChallengeDueAt() != null) {
+      if (now > lock.getObedienceChallengeDueAt()) {
+        failObedienceChallenge(lock, now, "服从超时未完成");
+        locks.save(lock);
+        return idleObedience(lock, now);
+      }
+      return openObedience(lock, now);
+    }
+    if (lock.getFrozenAt() != null) {
+      return idleObedience(lock, now);
+    }
+    long last =
+        lock.getObedienceLastCompletedAt() == null
+            ? lock.getStartedAt()
+            : lock.getObedienceLastCompletedAt();
+    long interval =
+        lock.getObedienceIntervalMs() == null ? 1_800_000L : lock.getObedienceIntervalMs();
+    if (now >= last + interval) {
+      long timeout =
+          lock.getObedienceTimeoutMs() == null ? 120_000L : lock.getObedienceTimeoutMs();
+      lock.setObedienceChallengeDueAt(now + timeout);
+      lock.setUpdatedAt(Instant.now());
+      appendEvent(lock, "obedience_open", timeout, "服从确认开始");
+      locks.save(lock);
+      return openObedience(lock, now);
+    }
+    return idleObedience(lock, now);
+  }
+
+  @Transactional
+  public ObedienceStatus completeObedience(ObedienceCompleteRequest req) {
+    LockEntity lock = requireActiveWearer(req.token());
+    long now = System.currentTimeMillis();
+    if (!lock.isObedienceEnabled()) {
+      throw new IllegalArgumentException("未开启服从确认");
+    }
+    if (lock.getObedienceChallengeDueAt() == null) {
+      throw new IllegalArgumentException("当前没有服从任务");
+    }
+    if (now > lock.getObedienceChallengeDueAt()) {
+      failObedienceChallenge(lock, now, "服从超时未完成");
+      locks.save(lock);
+      throw new IllegalArgumentException("已超时，已加罚 " + formatDurationZh(penaltyOf(lock)));
+    }
+    String expected = normalizePhrase(lock.getObediencePhrase());
+    String actual = normalizePhrase(req.phrase() == null ? "" : req.phrase());
+    if (actual.isEmpty()) {
+      throw new IllegalArgumentException("请输入服从短句");
+    }
+    if (!expected.equals(actual)) {
+      throw new IllegalArgumentException("短句不正确");
+    }
+    lock.setObedienceChallengeDueAt(null);
+    lock.setObedienceLastCompletedAt(now);
+    lock.setObedienceSuccessCount(lock.getObedienceSuccessCount() + 1);
+    lock.setUpdatedAt(Instant.now());
+    appendEvent(lock, "obedience_success", 0, "服从确认成功");
+    locks.save(lock);
+    return idleObedience(lock, now);
+  }
+
+  private void failObedienceChallenge(LockEntity lock, long now, String detail) {
+    long penalty = penaltyOf(lock);
+    applyTimeDelta(lock, penalty, now);
+    lock.setObedienceFailCount(lock.getObedienceFailCount() + 1);
+    lock.setObedienceChallengeDueAt(null);
+    lock.setObedienceLastCompletedAt(now);
+    lock.setUpdatedAt(Instant.now());
+    appendEvent(lock, "obedience_fail", penalty, detail);
+  }
+
+  private long penaltyOf(LockEntity lock) {
+    return lock.getObediencePenaltyMs() == null ? 3_600_000L : lock.getObediencePenaltyMs();
+  }
+
+  private ObedienceStatus openObedience(LockEntity lock, long now) {
+    long due = lock.getObedienceChallengeDueAt();
+    return new ObedienceStatus(
+        true,
+        lock.getObediencePhrase(),
+        due,
+        now,
+        Math.max(0, due - now),
+        penaltyOf(lock),
+        lock.getObedienceSuccessCount(),
+        lock.getObedienceFailCount(),
+        toView(lock, false));
+  }
+
+  private ObedienceStatus idleObedience(LockEntity lock, long now) {
+    return new ObedienceStatus(
+        false,
+        null,
+        null,
+        now,
+        0,
+        penaltyOf(lock),
+        lock.getObedienceSuccessCount(),
+        lock.getObedienceFailCount(),
+        toView(lock, false));
   }
 
   @Transactional
@@ -234,7 +421,7 @@ public class LockService {
     lock.setPhotoThumb(null);
     lock.setUpdatedAt(Instant.now());
     appendEvent(lock, "photo_request", 0, "要求拍照");
-    return toView(locks.save(lock));
+    return toView(locks.save(lock), true);
   }
 
   @Transactional
@@ -250,7 +437,7 @@ public class LockService {
     lock.setPhotoRequestActive(false);
     lock.setUpdatedAt(Instant.now());
     appendEvent(lock, "photo_submit", 0, "提交拍照");
-    return toView(locks.save(lock));
+    return toView(locks.save(lock), false);
   }
 
   @Transactional
@@ -301,7 +488,7 @@ public class LockService {
       applyTimeDelta(lock, -task.getRewardMs(), now);
       locks.save(lock);
     }
-    return new CompleteTaskResponse(toView(lock), toTaskView(task));
+    return new CompleteTaskResponse(toView(lock, "keyholder".equals(req.role())), toTaskView(task));
   }
 
   @Transactional
@@ -335,7 +522,7 @@ public class LockService {
     lock.setLastClientNow(client);
     lock.setUpdatedAt(Instant.now());
     locks.save(lock);
-    return new IntegrityResponse(toView(lock), penalties);
+    return new IntegrityResponse(toView(lock, false), penalties);
   }
 
   @Transactional
@@ -348,7 +535,7 @@ public class LockService {
     lock.setKeyholderUserId(userId);
     lock.setUpdatedAt(Instant.now());
     appendEvent(lock, "keyholder_claim", 0, "钥匙账号已绑定");
-    return toView(locks.save(lock));
+    return toView(locks.save(lock), true);
   }
 
   public List<ManagedLockSummary> listKeyholderLocks(String userId) {
@@ -413,10 +600,72 @@ public class LockService {
     }
   }
 
-  private void requirePhrase(LockEntity lock, String phrase) {
-    String a = normalizePhrase(lock.getEndPhrase());
-    String b = normalizePhrase(phrase == null ? "" : phrase);
-    if (!a.equals(b)) throw new IllegalArgumentException("结束宣言不正确");
+  /**
+   * Wearer must type the full end phrase exactly. Wrong attempts are counted;
+   * reaching {@code phraseMaxFails} applies {@code phraseFailPenaltyMs} and resets the streak.
+   */
+  private void assertPhraseOrPenalize(LockEntity lock, String phrase) {
+    String expected = normalizePhrase(lock.getEndPhrase());
+    String actual = normalizePhrase(phrase == null ? "" : phrase);
+    if (expected.isEmpty() || expected.length() < 4) {
+      throw new IllegalStateException("锁定未配置有效结束宣言");
+    }
+    if (actual.isEmpty()) {
+      throw new IllegalArgumentException("请完整输入结束宣言");
+    }
+    if (expected.equals(actual)) {
+      return;
+    }
+
+    long now = System.currentTimeMillis();
+    int fails = lock.getPhraseFailCount() + 1;
+    int maxFails = Math.max(1, lock.getPhraseMaxFails());
+    long penaltyMs = lock.getPhraseFailPenaltyMs() == null ? 3_600_000L : lock.getPhraseFailPenaltyMs();
+
+    appendEvent(
+        lock,
+        "phrase_fail",
+        0,
+        "结束宣言错误（" + fails + "/" + maxFails + "）");
+
+    if (fails >= maxFails) {
+      applyTimeDelta(lock, penaltyMs, now);
+      lock.setPhraseFailCount(0);
+      appendEvent(
+          lock,
+          "phrase_fail_penalty",
+          penaltyMs,
+          "宣言连续输错 " + maxFails + " 次，加罚");
+      lock.setUpdatedAt(Instant.now());
+      locks.save(lock);
+      throw new IllegalArgumentException(
+          "结束宣言不正确。已连续输错 "
+              + maxFails
+              + " 次，锁定时间 +"
+              + formatDurationZh(penaltyMs));
+    }
+
+    lock.setPhraseFailCount(fails);
+    lock.setUpdatedAt(Instant.now());
+    locks.save(lock);
+    throw new IllegalArgumentException(
+        "结束宣言不正确（"
+            + fails
+            + "/"
+            + maxFails
+            + "）。再错 "
+            + (maxFails - fails)
+            + " 次将加罚 "
+            + formatDurationZh(penaltyMs));
+  }
+
+  private static String formatDurationZh(long ms) {
+    long minutes = Math.max(1, Math.round(ms / 60_000.0));
+    if (minutes < 60) return minutes + " 分钟";
+    long hours = minutes / 60;
+    long rem = minutes % 60;
+    if (rem == 0) return hours + " 小时";
+    return hours + " 小时 " + rem + " 分钟";
   }
 
   private LockEntity requireActiveWearer(String token) {
@@ -481,6 +730,10 @@ public class LockService {
     return Math.max(min, Math.min(max, v));
   }
 
+  private static int clampInt(int v, int min, int max) {
+    return Math.max(min, Math.min(max, v));
+  }
+
   private static String normalizePhrase(String s) {
     return s == null ? "" : s.stripTrailing();
   }
@@ -490,7 +743,8 @@ public class LockService {
     return "cooldown_24h";
   }
 
-  private LockView toView(LockEntity l) {
+  private LockView toView(LockEntity l, boolean revealPhrase) {
+    String phrase = l.getEndPhrase() == null ? "" : l.getEndPhrase();
     return new LockView(
         l.getId(),
         l.getWearerToken(),
@@ -508,7 +762,11 @@ public class LockService {
         l.getHygienePenaltyMode(),
         l.getHygienePenaltyFixedMs(),
         l.getHygienePenaltyMultiplier(),
-        l.getEndPhrase(),
+        revealPhrase ? phrase : "",
+        phrase.length(),
+        l.getPhraseFailCount(),
+        l.getPhraseMaxFails(),
+        l.getPhraseFailPenaltyMs() == null ? 3_600_000L : l.getPhraseFailPenaltyMs(),
         l.isNotifyExpiry(),
         l.getHygieneStartedAt(),
         l.getFrozenAt(),
@@ -517,8 +775,13 @@ public class LockService {
         l.getPhotoSubmittedAt(),
         l.getPhotoThumb(),
         l.isObedienceEnabled(),
-        l.getObedienceIntervalMs(),
-        l.getObediencePhrase(),
+        l.getObedienceIntervalMs() == null ? 1_800_000L : l.getObedienceIntervalMs(),
+        revealPhrase ? (l.getObediencePhrase() == null ? "" : l.getObediencePhrase()) : "",
+        l.getObedienceTimeoutMs() == null ? 120_000L : l.getObedienceTimeoutMs(),
+        l.getObediencePenaltyMs() == null ? 3_600_000L : l.getObediencePenaltyMs(),
+        l.getObedienceSuccessCount(),
+        l.getObedienceFailCount(),
+        l.getObedienceChallengeDueAt(),
         l.getLastClientNow(),
         l.getIntegrityPenaltyCount(),
         l.getSessionNonce(),

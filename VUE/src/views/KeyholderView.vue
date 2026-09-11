@@ -47,6 +47,49 @@
         </div>
 
         <div class="card stack">
+          <p class="muted">服从确认规则</p>
+          <label class="check">
+            <input v-model="obEnabled" type="checkbox" /> 开启定期服从
+          </label>
+          <label class="field">
+            间隔（分钟）
+            <input v-model.number="obIntervalMin" type="number" min="1" max="1440" />
+          </label>
+          <label class="field">
+            短句
+            <input v-model="obPhrase" maxlength="80" />
+          </label>
+          <label class="field">
+            应答时限（秒）
+            <input v-model.number="obTimeoutSec" type="number" min="30" max="1800" />
+          </label>
+          <label class="field">
+            超时加罚（小时）
+            <input v-model.number="obPenaltyHours" type="number" min="0.1" step="0.5" />
+          </label>
+          <p class="muted" style="font-size:0.8rem">
+            成功 {{ lock.obedienceSuccessCount || 0 }} · 失败 {{ lock.obedienceFailCount || 0 }}
+          </p>
+          <button class="btn secondary" :disabled="busy" @click="saveObedience">保存服从规则</button>
+        </div>
+
+        <div class="card stack">
+          <p class="muted">结束宣言（佩戴者到期/紧急须完整输入）</p>
+          <input v-model="editPhrase" maxlength="200" autocomplete="off" />
+          <label class="field">
+            输错几次加罚
+            <input v-model.number="editMaxFails" type="number" min="1" max="20" />
+          </label>
+          <label class="field">
+            加罚小时
+            <input v-model.number="editPenaltyHours" type="number" min="0.1" step="0.5" />
+          </label>
+          <button class="btn secondary" :disabled="busy || editPhrase.trim().length < 4" @click="savePhrase">
+            保存宣言规则
+          </button>
+        </div>
+
+        <div class="card stack">
           <p class="muted">发布任务</p>
           <input v-model="taskTitle" placeholder="任务内容" />
           <select v-model="rewardType">
@@ -88,6 +131,14 @@ const message = ref('')
 const now = ref(Date.now())
 const taskTitle = ref('')
 const rewardType = ref('reduce')
+const editPhrase = ref('')
+const editMaxFails = ref(3)
+const editPenaltyHours = ref(1)
+const obEnabled = ref(true)
+const obIntervalMin = ref(30)
+const obPhrase = ref('服从主人')
+const obTimeoutSec = ref(120)
+const obPenaltyHours = ref(1)
 const remain = computed(() => remainingMs(lock.value, now.value))
 let poll
 let tick
@@ -96,7 +147,17 @@ async function load() {
   try {
     const remote = await api.getByKeyholder(code.value)
     lock.value = remote?.id ? remote : null
-    if (lock.value) tasks.value = await api.listTasks(code.value, 'keyholder')
+    if (lock.value) {
+      tasks.value = await api.listTasks(code.value, 'keyholder')
+      editPhrase.value = lock.value.endPhrase || ''
+      editMaxFails.value = lock.value.phraseMaxFails || 3
+      editPenaltyHours.value = Math.max(0.1, (lock.value.phraseFailPenaltyMs || 3600000) / 3600000)
+      obEnabled.value = !!lock.value.obedienceEnabled
+      obIntervalMin.value = Math.max(1, Math.round((lock.value.obedienceIntervalMs || 1800000) / 60000))
+      obPhrase.value = lock.value.obediencePhrase || '服从主人'
+      obTimeoutSec.value = Math.max(30, Math.round((lock.value.obedienceTimeoutMs || 120000) / 1000))
+      obPenaltyHours.value = Math.max(0.1, (lock.value.obediencePenaltyMs || 3600000) / 3600000)
+    }
     error.value = ''
   } catch (e) {
     error.value = e.message
@@ -148,6 +209,30 @@ const toggleFreeze = () =>
 const forceHygiene = () =>
   run(() => api.hygieneStart({ token: code.value, role: 'keyholder' }), '已强制清洁')
 const reqPhoto = () => run(() => api.photoRequest({ token: code.value }), '已请求拍照')
+const savePhrase = () =>
+  run(
+    () =>
+      api.setEndPhrase({
+        token: code.value,
+        endPhrase: editPhrase.value,
+        phraseMaxFails: editMaxFails.value,
+        phraseFailPenaltyMs: Math.round(editPenaltyHours.value * 3600_000),
+      }),
+    '宣言规则已更新',
+  )
+const saveObedience = () =>
+  run(
+    () =>
+      api.setObedience({
+        token: code.value,
+        enabled: obEnabled.value,
+        intervalMs: obIntervalMin.value * 60_000,
+        phrase: obPhrase.value,
+        timeoutMs: obTimeoutSec.value * 1000,
+        penaltyMs: Math.round(obPenaltyHours.value * 3600_000),
+      }),
+    '服从规则已更新',
+  )
 const newTask = () =>
   run(
     () =>

@@ -129,3 +129,23 @@ label.field { display: grid; gap: 0.35rem; font-size: 0.85rem; color: var(--mute
   padding: 1.25rem;
   box-shadow: var(--border);
 }
+
+.obedience-force {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: grid;
+  place-items: center;
+  padding: 1.5rem;
+  background: rgba(4, 3, 8, 0.94);
+  backdrop-filter: blur(8px);
+  overscroll-behavior: none;
+  touch-action: none;
+}
+.obedience-force__panel {
+  width: min(26rem, 100%);
+  padding: 1.5rem;
+  border-radius: 1.1rem;
+  background: var(--surface);
+  box-shadow: var(--border), 0 20px 60px rgba(0, 0, 0, 0.45);
+}
